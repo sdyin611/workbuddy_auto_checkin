@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推飞书。
+"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推飞书 / Server酱（微信）。
 
 设计要点：
   1. 一次运行把签到与派猫都做掉；
@@ -17,6 +17,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
@@ -357,6 +358,53 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
             return False, "重试 %d 次后仍异常：%s: %s" % (MAX_RETRY, type(e).__name__, e)
 
 
+# ---------------------------------------------------------------- Server酱（微信）
+
+def push_serverchan(sendkey, checkin_line, buddy_line, overall_ok):
+    """推送到 Server酱（微信服务号）。返回 (ok, reason)。
+
+    重试策略与飞书通道一致：网络异常 / 5xx 退避重试；业务拒绝不重试。
+    文末固定附 token 过期的处理指引，认证被拒时用户照着做即可。
+    """
+    title = "Buddy 加油站 · %s" % ("签到成功" if overall_ok else "签到失败")
+    desp = "\n\n".join([
+        "**签到**\n" + checkin_line,
+        "**猫猫旅行**\n" + buddy_line,
+        "---\naccessToken 有效期约 28 天。若上方签到显示**认证被拒**："
+        "本机重跑 `refresh_token.py` 导出新 token，"
+        "再到 GitHub 仓库 Settings → Secrets → Actions 更新 `WB_ACCESS_TOKEN`。",
+    ])
+    data = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
+    url = "https://sctapi.ftqq.com/%s.send" % sendkey
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            req = urllib.request.Request(url, data=data, method="POST",
+                                         headers={"Content-Type": "application/x-www-form-urlencoded"})
+            with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+                log("  [Server酱] HTTP %s code=%s" % (resp.status, body.get("code")))
+                if body.get("code") == 0:
+                    return True, ""
+                return False, "Server酱返回码 %s（%s）" % (body.get("code"), body.get("message", ""))
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 and attempt < MAX_RETRY:
+                log("  [Server酱] HTTP %s，退避后重试（%d/%d）" % (e.code, attempt, MAX_RETRY))
+                time.sleep(2.0 * attempt)
+                continue
+            if e.code >= 500:
+                return False, "重试 %d 次后仍 HTTP %s" % (MAX_RETRY, e.code)
+            return False, "HTTP %s（SendKey 无效或格式不对）" % e.code
+        except Exception as e:
+            if attempt < MAX_RETRY:
+                log("  [Server酱] 请求异常，退避后重试（%d/%d）：%s: %s"
+                    % (attempt, MAX_RETRY, type(e).__name__, e))
+                time.sleep(2.0 * attempt)
+                continue
+            return False, "重试 %d 次后仍异常：%s: %s" % (MAX_RETRY, type(e).__name__, e)
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main():
@@ -394,10 +442,27 @@ def main():
     checkin_line = ("✅ " if checkin_ok else "❌ ") + checkin["report"]
     buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
 
-    # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论
-    push_ok, push_reason = None, "未配置（缺少 FEISHU_WEBHOOK，本次不推送）"
-    if webhook:
-        push_ok, push_reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
+    # 推送策略：只在需要人工处理时推送（签到未达成：认证被拒 / 网络失败 / 接口异常）。
+    # 正常领取（CLAIMED / ALREADY）与活动未开启（INACTIVE）保持安静。
+    # 双通道相互独立（飞书 / Server酱微信），配置哪个推哪个。
+    sct_key = os.environ.get("SCT_SENDKEY")
+    if checkin_ok:
+        push_ok, push_reason = None, "签到正常，按策略不推送"
+    else:
+        pushes = []
+        if webhook:
+            ok, reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
+            pushes.append(("飞书", ok, reason))
+        if sct_key:
+            ok, reason = push_serverchan(sct_key, checkin_line, buddy_line, overall_ok)
+            pushes.append(("微信(Server酱)", ok, reason))
+        if pushes:
+            push_ok = any(ok for _, ok, _ in pushes)
+            push_reason = "；".join("%s %s" % (name, "✅" if ok else "❌ " + reason)
+                                    for name, ok, reason in pushes)
+        else:
+            push_ok = None
+            push_reason = "签到未达成，但未配置推送渠道（缺少 FEISHU_WEBHOOK / SCT_SENDKEY）"
 
     result = {
         "checkin": {"ok": checkin_ok, **checkin},
@@ -411,13 +476,14 @@ def main():
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
-            push_line = ("✅ 已推送到飞书" if push_ok
-                         else "❌ 推送失败：%s" % push_reason)
+            push_line = ("✅ 已推送（%s）" % push_reason) if push_ok else \
+                        (("❌ 推送失败：%s" % push_reason) if push_ok is not None
+                         else "－ %s" % push_reason)
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
                 f.write("| 签到 | %s |\n" % checkin_line)
                 f.write("| 猫猫旅行 | %s |\n" % buddy_line)
-                f.write("| 飞书推送 | %s |\n" % push_line)
+                f.write("| 消息推送 | %s |\n" % push_line)
                 f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok else "失败（签到未达成）"))
         except OSError as e:
             log("结果文件写入失败：%s" % e)
