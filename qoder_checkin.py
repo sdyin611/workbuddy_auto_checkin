@@ -16,7 +16,6 @@
 
 import json
 import os
-import socket
 import ssl
 import sys
 import time
@@ -24,17 +23,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-OPENAPI_BASE = "https://openapi.qoder.com.cn"          # 国内版 PAT 兑换基址
-SASH_BASE = os.environ.get("QODER_SASH_BASE") or "https://qoder.com.cn"  # 活动平台基址
+OPENAPI_BASE = "https://openapi.qoder.com.cn"          # 国内版：PAT 兑换与 sash 活动平台同域
+SASH_BASE = os.environ.get("QODER_SASH_BASE") or OPENAPI_BASE
 REQUEST_TIMEOUT = 20
 MAX_RETRY = 3
 
 CODE_NO_NETWORK = -1
 
-# 活动平台请求头集合（对齐官方桌面端 0.4.8，见 qoder2api-hub PR #75）
+# 活动平台请求头集合（对齐官方桌面端 0.4.8，见 qoder2api-hub PR #75）。
+# 注意：不发任何 Cosy-Machine* 机器身份头 —— cpa-multi-plugins campaign.go 的
+# no-machine 变体实证：零机器头返回未过滤的完整活动列表；伪造机器身份反而触发风控。
 COSY_CLIENT_TYPE = "10"
 COSY_VERSION = "0.4.8"
-COSY_MACHINE_OS = "x86_64_win32"
 
 
 def log(msg):
@@ -135,29 +135,45 @@ def auth_rejected(body):
 # ---------------------------------------------------------------- 第一步：PAT 兑换
 
 def exchange_token(pat):
-    """pt- 长期令牌 → jt- 访问令牌（24h）。返回 (access_token, err)。"""
+    """pt- 长期令牌 → jt- 访问令牌（24h）。返回 (access_token, err)。
+
+    社区实现存在三种请求形状（契约未统一），按序尝试直到命中：
+      A. body {"personal_token": pat}，无 Authorization 头 —— mmqz/cpa-multi-plugins
+         oauth.go 的官方客户端逆向实现（2026-11 活跃维护，首选）
+      B. body {"pat": pat}，无 Authorization 头
+      C. 空 body + Authorization: Bearer pt-... —— 旧逆向，2026-11-08 实测 400 已证伪
+    """
     url = OPENAPI_BASE + "/api/v1/jobToken/exchange"
-    headers = {
+    base_headers = {
         "Accept": "application/json",
-        "Authorization": "Bearer %s" % pat,
         "Content-Type": "application/json",
         "User-Agent": "Qoder",
     }
-    code, body = post(url, headers, {})
-    log("  [兑换] HTTP %s %s" % (code, json.dumps(masked(body), ensure_ascii=False)))
-    if code == CODE_NO_NETWORK:
-        return None, "NETWORK"
-    # 实测（2026-11-08，伪造 PAT）：无效/格式不对的 PAT 返回 HTTP 400 BadRequest，
-    # 被删除/过期的 PAT 预期为 401/403 —— 三者都按「凭证问题」处理。
-    if code in (400, 401, 403) or auth_rejected(body):
+    shapes = [
+        ("body:personal_token", dict(base_headers), {"personal_token": pat}),
+        ("body:pat", dict(base_headers), {"pat": pat}),
+        ("header:bearer", dict(base_headers, Authorization="Bearer %s" % pat), {}),
+    ]
+    last_code, last_body = None, None
+    for name, headers, payload in shapes:
+        code, body = post(url, headers, payload)
+        log("  [兑换·%s] HTTP %s %s" % (name, code, json.dumps(masked(body), ensure_ascii=False)))
+        if code == CODE_NO_NETWORK:
+            return None, "NETWORK"
+        if api_ok(code, body):
+            data = unwrap(body)
+            token = (data.get("token") or data.get("accessToken")
+                     or data.get("access_token") or data.get("jobToken"))
+            if token:
+                return str(token), None
+            log("  · 该形状返回 2xx 但未解析到 token，继续尝试下一形状")
+        last_code, last_body = code, body
+        if code in (401, 403) or auth_rejected(body):
+            return None, "AUTH"
+    # 三种形状都被拒：400 多为 PAT 无效/格式不对（2026-11-08 实测：空 body 错形状也回 400）
+    if last_code in (400, 401, 403) or auth_rejected(last_body):
         return None, "AUTH"
-    if not api_ok(code, body):
-        return None, "ERROR"
-    data = unwrap(body)
-    token = data.get("accessToken") or data.get("access_token") or data.get("jobToken")
-    if not token:
-        return None, "ERROR"
-    return str(token), None
+    return None, "ERROR"
 
 
 # ---------------------------------------------------------------- 第二步：签到
@@ -170,8 +186,6 @@ def campaign_headers(jt):
         "User-Agent": "Qoder",
         "Cosy-ClientType": COSY_CLIENT_TYPE,
         "Cosy-Version": COSY_VERSION,
-        "cosy-machinehostname": socket.gethostname() or "workbuddy-runner",
-        "cosy-machineos": COSY_MACHINE_OS,
     }
 
 
@@ -187,14 +201,25 @@ def _campaign_list(data):
 
 
 def _is_claimable(item):
-    state = str(item.get("status") or item.get("state") or "").upper()
+    # 官方客户端逆向：状态字段是 claimStatus（取值 CLAIMABLE / CLAIMED ...）
+    state = str(item.get("claimStatus") or item.get("status")
+                or item.get("state") or "").upper()
     return state in ("CLAIMABLE", "CAN_CLAIM", "AVAILABLE")
 
 
+def _campaign_id(item):
+    # campaignId 必须是 UUID（act- 开头的 key 形式会被 claim 拒绝 400）
+    return item.get("campaignId") or item.get("id") or item.get("activityId")
+
+
 def _claimable_desc(item):
-    name = item.get("name") or item.get("title") or item.get("campaignName") or "?"
-    reward = item.get("reward") or item.get("credit") or item.get("rewardCredit") or ""
-    return "%s%s" % (name, (" +%s" % reward) if reward != "" else "")
+    title = (item.get("campaignTitle") or item.get("title")
+             or item.get("campaignKey") or "?")
+    ben = item.get("benefit")
+    amount = ben.get("amount") if isinstance(ben, dict) else None
+    kind = (ben.get("kind") or "") if isinstance(ben, dict) else ""
+    unit = "积分" if str(kind).upper() == "CREDITS" else kind
+    return "%s%s" % (title, (" +%s %s" % (amount, unit)) if amount else "")
 
 
 def run_checkin(jt):
@@ -220,30 +245,49 @@ def run_checkin(jt):
 
     claimed, failed = [], []
     for it in claimable:
-        cid = it.get("id") or it.get("campaignId") or it.get("activityId")
+        cid = _campaign_id(it)
         if cid is None:
-            failed.append("%s（缺少 id）" % _claimable_desc(it))
+            failed.append("%s（缺少 campaignId）" % _claimable_desc(it))
             continue
         desc = _claimable_desc(it)
-        ccode, cbody = post("%s/sash/api/v1/me/campaigns/%s/claim" % (SASH_BASE, cid), headers, {})
+        ccode, cbody = post("%s/sash/api/v1/me/campaigns/%s/claim" % (SASH_BASE, cid),
+                            headers, {})
         log("  [领取 %s] HTTP %s %s" % (cid, ccode, json.dumps(masked(cbody), ensure_ascii=False)))
         if ccode == CODE_NO_NETWORK:
             failed.append("%s（网络未送达）" % desc)
-        elif ccode in (401, 403):
+            continue
+        if ccode in (401, 403):
             return False, {"result": "AUTH", "report": "认证被拒（HTTP %s）" % ccode}
-        elif api_ok(ccode, cbody):
-            got = dig(unwrap(cbody), "reward") or dig(unwrap(cbody), "credit") \
-                or dig(unwrap(cbody), "rewardCredit")
-            claimed.append("%s%s" % (desc, ("（+%s）" % got) if got else ""))
-        else:
-            msg = dig(cbody, "msg") or dig(cbody, "message") or ""
-            low = str(msg).lower()
-            # 「同一人已领取」「已领过」「名额发完」属正常幂等结果
-            if any(k in low for k in ("already", "same_person", "claimed", "sold out", "limit")) \
-                    or "已领" in str(msg) or "发完" in str(msg):
-                claimed.append("%s（服务端判定已领过/已发完）" % desc)
+
+        data = unwrap(cbody)
+        status = str(data.get("status") or "").upper()
+        failure = str(data.get("failureCode") or data.get("errorCode") or "").upper()
+
+        # 判定顺序（对齐 cpa-multi-plugins campaign.go 的线上契约）：
+        # 1) 显式 failureCode；2) HTTP 409 = 幂等重放（已领过）；3) status 判成功
+        if failure:
+            if any(k in failure for k in ("ALREADY", "SAME_PERSON", "REPLAYED")):
+                claimed.append("%s（服务端判定已领过）" % desc)
+            elif any(k in failure for k in ("OUT_OF_STOCK", "NOT_ACTIVE", "SOLD_OUT")):
+                claimed.append("%s（名额已发完/活动未生效）" % desc)
             else:
-                failed.append("%s：%s（HTTP %s）" % (desc, msg or "未知", ccode))
+                # RISK_BLOCKED / RISK_DEPENDENCY_UNAVAILABLE / ACHIEVEMENT_NOT_COMPLETED
+                # / FIELD_VALIDATION_FAILED 等属真失败，原样上报
+                failed.append("%s：%s（HTTP %s）" % (desc, failure, ccode))
+        elif ccode == 409:
+            claimed.append("%s（服务端判定已领过，HTTP 409）" % desc)
+        elif api_ok(ccode, cbody):
+            got = dig(data, "benefit", "amount")
+            if got is None:
+                got = data.get("rewardCredits") or data.get("reward_credits")
+            if status in ("CLAIMED", "GRANTED", "SUCCESS", ""):
+                claimed.append("%s%s" % (desc, ("（+%s）" % got) if got else ""))
+            else:
+                claimed.append("%s（状态 %s）" % (desc, status))
+        else:
+            msg = dig(cbody, "msg") or dig(cbody, "message") \
+                or dig(cbody, "errorMessage") or ""
+            failed.append("%s：%s（HTTP %s）" % (desc, msg or "未知", ccode))
 
     if claimed and not failed:
         return True, {"result": "CLAIMED", "report": "成功领取：%s" % "；".join(claimed)}
