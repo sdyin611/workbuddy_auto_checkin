@@ -1,0 +1,138 @@
+name: Qoder 每日签到（国际版）
+
+on:
+  schedule:
+    # GitHub cron 用 UTC；括号内为北京时间（UTC+8）。
+    # 活动每天 10:00 开窗，错过不补。三段时间互为备份：
+    # 10:05 主跑，10:35 / 11:05 覆盖 GitHub 延迟或上游晚放资格。
+    # 脚本幂等：已领只会报「今日已领取」，不会重复发放。
+    - cron: "5 2 * * *"    # 02:05 UTC = 10:05 北京
+    - cron: "35 2 * * *"   # 02:35 UTC = 10:35 北京
+    - cron: "5 3 * * *"    # 03:05 UTC = 11:05 北京
+  workflow_dispatch:
+    inputs:
+      verify_only:
+        description: "只读核验，不发送 claim"
+        required: false
+        default: false
+        type: boolean
+      already_ok:
+        description: "今日已手动领过时，把无核验基线按成功处理"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qoder-global-daily
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Shanghai
+      PYTHONIOENCODING: utf-8
+      QODER_CACHE_KEY: ${{ secrets.QODER_CACHE_KEY }}
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r qoder/requirements.txt
+
+      - name: 检查缓存密钥
+        if: ${{ env.QODER_CACHE_KEY == '' }}
+        run: |
+          echo "::warning::未设置 QODER_CACHE_KEY。本轮仍可签到，但 refresh_token 轮换后无法跨运行保存，约 28 天后需要重新授权。"
+
+      - name: 恢复加密的 token 状态
+        if: ${{ env.QODER_CACHE_KEY != '' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .qoder-cache/state.enc
+          key: qoder-global-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: qoder-global-state-v1-
+
+      - name: 解密 token 状态
+        if: ${{ env.QODER_CACHE_KEY != '' && hashFiles('.qoder-cache/state.enc') != '' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -salt \
+            -pass env:QODER_CACHE_KEY \
+            -in .qoder-cache/state.enc \
+            -out "$RUNNER_TEMP/qoder-state.tar"
+          tar -xf "$RUNNER_TEMP/qoder-state.tar" -C qoder
+          rm -f "$RUNNER_TEMP/qoder-state.tar"
+
+      - name: 执行签到与入账核验
+        env:
+          QODER_GLOBAL_TOKENS: ${{ secrets.QODER_GLOBAL_TOKENS }}
+          QODER_MACHINE_TOKEN: ${{ secrets.QODER_MACHINE_TOKEN }}
+          QODER_MACHINE_CODE: ${{ secrets.QODER_MACHINE_CODE }}
+          QODER_MACHINE_TYPE: ${{ secrets.QODER_MACHINE_TYPE }}
+          QODER_CLIENT_VERSION: "0.5.6"
+          QODER_VERIFY_POLLS: "6"
+          QODER_VERIFY_GAP: "5"
+          QODER_ALREADY_OK: ${{ github.event.inputs.already_ok == 'true' && '1' || '0' }}
+          QODER_RESULT_FILE: ${{ runner.temp }}/qoder_result.md
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          SCT_SENDKEY: ${{ secrets.SCT_SENDKEY }}
+        run: |
+          set -uo pipefail
+          python qoder/qoder_global_checkin.py ${{ github.event.inputs.verify_only == 'true' && '--verify-only' || '' }}
+          # 失败时保留非零退出码，让 Actions 变红并触发 GitHub 通知；
+          # 失败详情同时写入 step summary，并在配置了飞书/Server酱时推送。
+
+      - name: 加密并保存 token 状态
+        if: ${{ always() && env.QODER_CACHE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .qoder-cache
+          files=""
+          for f in qoder_tokens.json qoder_machine_id qoder_state.json; do
+            if [ -f "qoder/$f" ]; then files="$files $f"; fi
+          done
+          if [ -n "$files" ]; then
+            tar -cf "$RUNNER_TEMP/qoder-state.tar" -C qoder $files
+            openssl enc -aes-256-cbc -pbkdf2 -salt \
+              -pass env:QODER_CACHE_KEY \
+              -in "$RUNNER_TEMP/qoder-state.tar" \
+              -out .qoder-cache/state.enc
+            rm -f "$RUNNER_TEMP/qoder-state.tar"
+          fi
+
+      - name: 保存加密缓存
+        if: ${{ always() && env.QODER_CACHE_KEY != '' && hashFiles('.qoder-cache/state.enc') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .qoder-cache/state.enc
+          key: qoder-global-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 汇总
+        if: always()
+        env:
+          RESULT_FILE: ${{ runner.temp }}/qoder_result.md
+        run: |
+          set -uo pipefail
+          {
+            echo "### Qoder 每日签到（国际版）"
+            echo ""
+            echo "- 运行时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')（cron 为 UTC）"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RESULT_FILE" ]; then
+            cat "$RESULT_FILE" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- 未产出结论文案，请查看上方日志" >> "$GITHUB_STEP_SUMMARY"
+          fi

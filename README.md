@@ -17,6 +17,17 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 > 装了 Python 就跑 `refresh_token.py`；没装 Python 直接下载仓库里的
 > **`refresh_token.exe`** 双击运行，无需任何环境。
 
+## Qoder 国际版每日签到
+
+本仓库现在还包含 Qoder（国际版）的每日 100 Credits 自动领取：
+见 **[qoder/README.md](qoder/README.md)**，工作流是
+`.github/workflows/qoder-daily.yml`。
+
+- 每天北京时间 10:05 / 10:35 / 11:05 三次互备；
+- 领取后必须核验额度增量，`claim` 成功但没到账会判失败（`GRANT_NOT_LANDED`）；
+- 使用 `QODER_GLOBAL_TOKENS` + `QODER_CACHE_KEY` 两个 Secret；
+- 原来的中国版 PAT 方案保留为手动备用（`qoder.yml`），不再定时。
+
 ## 特性
 
 - **云端定时** — 免费 runner + `schedule` 触发，本机关机照常执行

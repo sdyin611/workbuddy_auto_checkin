@@ -1,15 +1,8 @@
-name: Qoder 每日签到
+name: Qoder 每日签到（中国版 PAT · 手动备用）
 
+# 国际版的每日签到已迁到 qoder-daily.yml（QODER_GLOBAL_TOKENS）。
+# 本工作流保留给 Qoder 中国版 + PAT 方案，只保留手动触发，避免两套定时重复跑。
 on:
-  schedule:
-    # GitHub 的 cron 按 UTC 计时（括号内为北京时间 UTC+8）。
-    # Qoder 每日 100 Credits 资格在北京时间每天 10:00 放出，错过不补，
-    # 所以首跑放在 10:30，后两个时段互为备份。
-    # 脚本幂等：claim 接口重复领取不会重复发放，多触发不会多领。
-    # 三个点都落在 :30，避开 GitHub 文档提示的整点高负载期。
-    - cron: "30 2 * * *"    # 02:30 UTC = 10:30 北京（主时段，等 10:00 放资格）
-    - cron: "30 6 * * *"    # 06:30 UTC = 14:30 北京（备份）
-    - cron: "30 12 * * *"   # 12:30 UTC = 20:30 北京（备份）
   workflow_dispatch:
 
 permissions:

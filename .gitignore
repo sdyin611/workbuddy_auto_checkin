@@ -9,3 +9,15 @@ token*.jpg
 build/
 dist/
 *.spec
+
+# Qoder 国际版签到的本机状态与凭据
+.qoder-cache/
+qoder/qoder_tokens.json
+qoder/qoder_machine_id
+qoder/qoder_state.json
+qoder/qoder_umid/
+qoder/.local-token
+qoder/.cloud-secrets.txt
+qoder/local_result.md
+qoder/*.result.json
+.login-output.txt
